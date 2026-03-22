@@ -1137,33 +1137,6 @@ impl<R: Read> Read for SharedProgressReader<R> {
     }
 }
 
-/// Tracks the one-time seed of pre-existing `.part` bytes into shared progress.
-///
-/// Bytes written during earlier retry attempts within the same `resumable_download`
-/// call are already counted by [`SharedProgressWriter`] and must not be re-added.
-struct ResumeSeed {
-    pending: u64,
-}
-
-impl ResumeSeed {
-    fn new(initial_part_size: u64) -> Self {
-        Self { pending: initial_part_size }
-    }
-
-    /// Seeds shared progress with pre-existing `.part` bytes at most once.
-    /// Discards the seed when the server does not confirm resume (`!is_partial`).
-    fn apply(&mut self, shared: &SharedProgress, is_partial: bool) {
-        if !is_partial {
-            self.pending = 0;
-            return;
-        }
-        if self.pending > 0 {
-            shared.add(self.pending);
-            self.pending = 0;
-        }
-    }
-}
-
 /// Downloads a file with resume support using HTTP Range requests.
 /// Automatically retries on failure, resuming from where it left off.
 /// Returns the path to the downloaded file and its total size.
@@ -1193,7 +1166,7 @@ fn resumable_download(
 
     let mut total_size: Option<u64> = None;
     let mut last_error: Option<eyre::Error> = None;
-    let mut resume_seed = ResumeSeed::new(fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0));
+    let mut resume_pending = fs::metadata(&part_path).map(|m| m.len()).ok();
 
     let finalize_download = |size: u64| -> Result<(PathBuf, u64)> {
         fs::rename(&part_path, &final_path)?;
@@ -1287,7 +1260,11 @@ fn resumable_download(
         let flush_result;
 
         if let Some(sp) = shared {
-            resume_seed.apply(sp, is_partial);
+            if let Some(bytes) = resume_pending.take() &&
+                is_partial
+            {
+                sp.add(bytes);
+            }
             let mut writer =
                 SharedProgressWriter { inner: BufWriter::new(file), progress: Arc::clone(sp) };
             copy_result = io::copy(&mut reader, &mut writer);
@@ -2117,53 +2094,5 @@ mod tests {
         assert_eq!(planned[0].ty, SnapshotComponentType::State);
         assert_eq!(planned[1].ty, SnapshotComponentType::RocksdbIndices);
         assert_eq!(planned[2].ty, SnapshotComponentType::Transactions);
-    }
-
-    #[test]
-    fn resume_seed_fresh_start_no_double_count() {
-        let sp = SharedProgress::new(100, 1, CancellationToken::new());
-        let mut seed = ResumeSeed::new(0);
-
-        // Attempt 1: fresh start (not partial), writer counts 30 bytes
-        seed.apply(&sp, false);
-        sp.add(30);
-
-        // Attempt 2: server confirms resume, but seed is 0 — no double-count
-        seed.apply(&sp, true);
-        sp.add(70);
-
-        assert_eq!(sp.downloaded.load(Ordering::Relaxed), 100);
-    }
-
-    #[test]
-    fn resume_seed_pre_existing_part_counted_once() {
-        let sp = SharedProgress::new(100, 1, CancellationToken::new());
-        let mut seed = ResumeSeed::new(40);
-
-        // Attempt 1: resume from 40-byte .part, writer counts 20
-        seed.apply(&sp, true);
-        sp.add(20);
-
-        // Attempt 2: seed already consumed, writer counts remaining 40
-        seed.apply(&sp, true);
-        sp.add(40);
-
-        assert_eq!(sp.downloaded.load(Ordering::Relaxed), 100);
-    }
-
-    #[test]
-    fn resume_seed_discarded_when_server_ignores_range() {
-        let sp = SharedProgress::new(100, 1, CancellationToken::new());
-        let mut seed = ResumeSeed::new(50);
-
-        // Attempt 1: server returns 200 (ignores Range), seed discarded
-        seed.apply(&sp, false);
-        sp.add(40);
-
-        // Attempt 2: server returns 206 this time, seed already gone
-        seed.apply(&sp, true);
-        sp.add(60);
-
-        assert_eq!(sp.downloaded.load(Ordering::Relaxed), 100);
     }
 }
